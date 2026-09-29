@@ -9,9 +9,11 @@ It consists of two main utilities:
   working tree using one of several LLM inference providers. It supports model
   selection, provider configuration, optional skills/instructions, read-only
   tool access, and machine-readable finding output.
-- **`review-new-series.sh`** : a Bash helper that watches for new branches
-  named like `series_<numbers>` on a configured Git remote and starts a single
-  `commit_review.py` run for all commits in the new series.
+- **`review-new-series.sh`** : a Bash helper that watches for new branches on
+  a configured Git remote and starts a single `commit_review.py` run for all
+  commits in the new series. Which branches are watched is controlled by the
+  `BRANCH_PATTERN` environment variable; when it is unset, every branch on the
+  remote is considered.
 
 The goal is to make it easy to review individual commits, commit ranges, or
 entire patch series without manually invoking the model for every commit.
@@ -38,13 +40,11 @@ instructions from `AGENTS.md` and skill files.
 
 `review-new-series.sh` is designed for automated series review.
 
-It checks a configured Git remote for newly seen branches matching:
+It checks a configured Git remote for newly seen branches matching the
+`BRANCH_PATTERN` glob (for example `series_<numbers>`). When `BRANCH_PATTERN`
+is unset, every branch on the remote is considered.
 
-```text
-series_<numbers>
-```
-
-When a new series branch is found, it runs a single instance of the review
+When a new branch is found, it runs a single instance of the review
 script against all commits introduced by that branch. The number of commits to
 review is measured relative to a configured base ref, usually the main
 integration branch such as `origin/master`.
@@ -338,8 +338,10 @@ commit specs: a single rev (3fed0e7c2, HEAD), a range (HEAD..HEAD~6), or -N for 
 `review-new-series.sh` is meant to run periodically, for example from cron or a
 systemd timer.
 
-It reviews newly-created `series_XXXX` branches appearing on the configured
-remote.
+It reviews newly-created branches appearing on the configured remote. By
+default (with `BRANCH_PATTERN` unset) every branch on the remote is
+considered; set `BRANCH_PATTERN` to restrict which branch names are watched,
+for example `BRANCH_PATTERN=series_[0-9]*`.
 
 ### Example configuration
 
@@ -349,8 +351,13 @@ Configuration is supplied through environment variables:
 # Path to the Git repository to inspect.
 REPO=/home/me/git/for-review
 
-# Remote to watch for new series branches.
+# Remote to watch for new branches.
 REMOTE=origin
+
+# Glob matched against remote branch names. When unset (the default),
+# every branch on the remote is considered. For example, to only review
+# series branches:
+# BRANCH_PATTERN=series_[0-9]*
 
 # Base ref against which the series is measured.
 BASE_REF=origin/master
@@ -423,6 +430,7 @@ A simple cron entry might look like this:
 */5 * * * * \
   REPO=/home/me/git/for-review \
   REMOTE=origin \
+  BRANCH_PATTERN=series_[0-9]* \
   BASE_REF=origin/master \
   REVIEW_SCRIPT=/home/me/git/commit_review.py \
   REVIEW_ARGS=--provider openai --model my-model --max-turns 20 \
@@ -441,6 +449,7 @@ Example `review-new-series.env`:
 ```bash
 REPO=/home/me/git/for-review
 REMOTE=origin
+BRANCH_PATTERN=series_[0-9]*
 BASE_REF=origin/master
 REVIEW_SCRIPT=/home/me/git/commit_review.py
 REVIEW_ARGS=--provider openai --model my-model --max-turns 20
@@ -603,7 +612,7 @@ Check:
 
 - `REPO` points to the correct repository
 - `REMOTE` is the correct remote name
-- the branch name matches `series_<numbers>`
+- the branch name matches `BRANCH_PATTERN` (every branch when unset)
 - `BASE_REF` exists and is up to date
 - the state file has not already recorded the branch
 
@@ -645,8 +654,8 @@ This project gives you two levels of operation:
 2. **Automated series discovery and review** with `review-new-series.sh`.
 
 Together, they make it straightforward to review individual commits, commit
-ranges, or newly pushed `series_<numbers>` branches using a configured LLM
-provider and repository-specific review instructions.
+ranges, or newly pushed branches on a configured remote using a configured
+LLM provider and repository-specific review instructions.
 
 # Licensing
 

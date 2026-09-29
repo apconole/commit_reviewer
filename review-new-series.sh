@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Review newly-created series_XXXX branches appearing on the origin remote.
+# Review newly-created branches appearing on the configured remote.
 #
 # Configuration can be supplied through environment variables:
 #
@@ -12,6 +12,10 @@
 #   MAIL_TO=me@example.com
 #   MAIL_FROM=me@example.com
 #   STATE_FILE=/home/me/.cache/review-new-series/seen
+#   BRANCH_PATTERN=series_[0-9]*
+#
+# BRANCH_PATTERN is a glob matched against remote branch names. When it is
+# empty (the default), every branch on the remote is considered.
 #
 # The important one is BASE_REF: it should be the branch against which
 # commit_review.py's "-X" count is supposed to be measured.
@@ -44,6 +48,11 @@ STATE_FILE="${STATE_FILE:-$HOME/.cache/review-new-series/seen}"
 
 # Put temporary worktrees outside the repository.
 WORKTREE_ROOT="${WORKTREE_ROOT:-${TMPDIR:-/tmp}/review-new-series}"
+
+# Glob matched against remote branch names (the part of the ref after
+# refs/remotes/${REMOTE}/). An empty pattern matches every branch on the
+# remote.
+BRANCH_PATTERN="${BRANCH_PATTERN:-}"
 
 # Use an explicit PATH because cron's PATH is often much smaller than the
 # PATH you get from an interactive shell.
@@ -153,17 +162,34 @@ log "updating remote $REMOTE"
 "$GIT" remote update "$REMOTE"
 
 ###############################################################################
-# Find series_XXXX remote-tracking branches.
+# Find remote-tracking branches matching BRANCH_PATTERN.
 ###############################################################################
 
-mapfile -t SERIES_REFS < <(
+if [[ -n "$BRANCH_PATTERN" ]]; then
+    REF_PATTERN="refs/remotes/${REMOTE}/${BRANCH_PATTERN}"
+    log "looking for branches matching $BRANCH_PATTERN"
+else
+    REF_PATTERN="refs/remotes/${REMOTE}/"
+    log "looking for all branches on $REMOTE"
+fi
+
+mapfile -t REFS < <(
     "$GIT" for-each-ref \
-        --format='%(refname:short)' \
-        "refs/remotes/${REMOTE}/series_[0-9]*"
+        --format='%(refname)' \
+        "$REF_PATTERN"
 )
 
+# refs/remotes/${REMOTE}/HEAD is a symbolic ref to the remote's default
+# branch, not a branch itself. Never treat it as a review target.
+SERIES_REFS=()
+for ref in "${REFS[@]}"; do
+    if [[ "$ref" != "refs/remotes/${REMOTE}/HEAD" ]]; then
+        SERIES_REFS+=("${ref#refs/remotes/}")
+    fi
+done
+
 if (( ${#SERIES_REFS[@]} == 0 )); then
-    log "no series_XXXX branches found"
+    log "no branches found"
     exit 0
 fi
 
@@ -192,7 +218,7 @@ if [[ ! -f "$STATE_FILE" ]]; then
 
     mv "$tmp_state" "$STATE_FILE"
 
-    log "initialized state with ${#SERIES_REFS[@]} existing series branch(es)"
+    log "initialized state with ${#SERIES_REFS[@]} existing branch(es)"
     log "no reviews sent on this first run"
     exit 0
 fi
