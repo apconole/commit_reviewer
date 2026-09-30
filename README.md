@@ -24,7 +24,9 @@ entire patch series without manually invoking the model for every commit.
 
 ### `commit_review.py`
 
-`commit_review.py` performs per-commit LLM analysis with read-only tool access.
+`commit_review.py` performs per-commit LLM analysis with read-only tool
+access. The one non-repository tool is `TodoWrite`, which lets the model
+maintain an in-memory task list; it never modifies the repository.
 
 It accepts Git commit specifications such as:
 
@@ -227,7 +229,7 @@ By default, the review tool may load repository-level review guidance from
 
 | Option | Description |
 | --- | --- |
-| `--output-dir OUTPUT_DIR` | Write review artifacts to this directory. Produces `<sha>.review.md` and `<sha>.findings.json`. |
+| `--output-dir OUTPUT_DIR` | Write review artifacts to this directory. Produces `<sha>.review.md` and `<sha>.findings.json`; with `--verbose`, also `<sha>.todos.json` (the model's final `TodoWrite` list). |
 | `--fail-on-severity {none,low,medium,high}` | Exit non-zero if any finding meets or exceeds the given severity. Default: `none`. |
 
 Examples:
@@ -546,8 +548,9 @@ commit_review.py \
 - Prefer environment variables or secret managers for credentials.
 - Use `--env-var` when possible to avoid putting secrets directly on the
   command line.
-- The review tool is intended to have read-only tool access, but you should
-  still treat model output as untrusted input.
+- The review tool is intended to have read-only tool access (the `TodoWrite`
+  tool only maintains an in-memory task list), but you should still treat
+  model output as untrusted input.
 - If you use `--show-thinking` or `--verbose`, be aware that logs may contain
   repository contents, prompts, or model reasoning.
 

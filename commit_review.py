@@ -18,7 +18,8 @@
 
 Reviews one commit, a list of commits, or a range of commits using an LLM
 with read-only tool access (file reading, directory listing, git show, git
-log, grep, sed-based reads, awk-based reads).
+log, grep, sed-based reads, awk-based reads).  TodoWrite additionally
+maintains an in-memory task list; it never touches the repository.
 
 Providers:
   anthropic  Anthropic Messages API (x-api-key or bearer token auth)
@@ -45,7 +46,9 @@ Commit specifications:
   -4             shorthand for the last 4 commits (HEAD~4..HEAD)
 
 The review process starts from a safe, read-only instruction set built into
-the system prompt; all tools are read-only and confined to the repository.
+the system prompt; all tools are read-only and confined to the repository,
+with the single exception of TodoWrite, which only tracks the reviewer's
+own progress in memory.
 """
 
 import argparse
@@ -132,7 +135,8 @@ If something is ambiguous, ask a sharp question, don't guess.
 SAFETY RULES (absolute):
 1. You have READ-ONLY tools.  Never attempt to modify, create, or delete
    files, and never request actions that change repository or system state.
-   If you find a bug, report it; do not attempt to fix it.
+   If you find a bug, report it; do not attempt to fix it.  TodoWrite is
+   the one exception: it only updates your in-memory task list.
 2. Only inspect the repository working tree and git history via the tools
    provided.  Do not access the network or anything outside the repository.
 3. If a credential or secret appears in the code, flag it as a finding but
@@ -369,7 +373,8 @@ def build_system_prompt(root, agents_files, skills, selected_skills):
 
 
 # ---------------------------------------------------------------------------
-# Tool implementations (all read-only, confined to the repository root)
+# Tool implementations (all read-only, confined to the repository root;
+# TodoWrite only tracks in-memory review progress)
 # ---------------------------------------------------------------------------
 
 
@@ -740,6 +745,49 @@ def tool_awk_read(root, args, verbose):
     return run_external(["awk", program, path])
 
 
+TODO_STATUSES = ("pending", "in_progress", "completed")
+MAX_TODO_ITEMS = 100
+
+
+def tool_todo_write(state, args):
+    """Replace the in-memory todo list for the commit under review.
+
+    The list is session state only; nothing is written to the repository.
+    """
+    todos = args.get("todos")
+    if not isinstance(todos, list):
+        raise ToolError("todos must be an array")
+    if len(todos) > MAX_TODO_ITEMS:
+        raise ToolError("too many todos (max %d)" % MAX_TODO_ITEMS)
+    out = []
+    for i, item in enumerate(todos):
+        if not isinstance(item, dict):
+            raise ToolError("todo %d is not an object" % i)
+        content = item.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ToolError("todo %d has no content" % i)
+        status = item.get("status") or "pending"
+        if status not in TODO_STATUSES:
+            raise ToolError("todo %d has invalid status: %r"
+                            % (i, status))
+        active = item.get("activeForm")
+        if not isinstance(active, str) or not active.strip():
+            active = content
+        out.append({"content": content, "status": status,
+                    "activeForm": active})
+    state["todos"] = out
+    done = sum(1 for t in out if t["status"] == "completed")
+    if state.get("verbose"):
+        marks = {"completed": "x", "in_progress": ">", "pending": " "}
+        warn("todos: %d item(s), %d completed" % (len(out), done))
+        for t in out:
+            suffix = " (%s)" % t["activeForm"] \
+                if t["status"] == "in_progress" else ""
+            warn("  [%s] %s%s" % (marks[t["status"]], t["content"], suffix))
+    return "Todo list updated: %d item(s), %d completed. Continue the " \
+           "review and keep the list current." % (len(out), done)
+
+
 def tool_schemas():
     return [
         {
@@ -882,6 +930,41 @@ def tool_schemas():
                 "required": ["name"],
             },
         },
+        {
+            "name": "TodoWrite",
+            "description": "Create or replace the todo list used to track "
+                           "progress through the review of the commit "
+                           "under analysis. Pass the complete list on "
+                           "every call and update statuses as you make "
+                           "progress. Only updates in-memory session "
+                           "state; never touches the repository.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string",
+                                            "description": "What needs "
+                                                           "to be done"},
+                                "status": {"type": "string",
+                                           "enum": list(TODO_STATUSES)},
+                                "activeForm": {"type": "string",
+                                                "description":
+                                                "Present-tense label "
+                                                "shown while the item "
+                                                "is in progress"},
+                            },
+                            "required": ["content", "status",
+                                         "activeForm"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
     ]
 
 
@@ -904,6 +987,8 @@ def run_tool(name, args, state):
     if name == "load_skill":
         return tool_load_skill(root, args, state["verbose"],
                                state["skills"])
+    if name == "TodoWrite":
+        return tool_todo_write(state, args)
     raise ToolError("unknown tool: %s" % name)
 
 
@@ -1379,6 +1464,7 @@ def review_commit(sha, provider, system, state, max_turns):
     """Run the tool-calling loop for one commit; return (text, stats)."""
     verbose = state["verbose"]
     show_thinking = state["show_thinking"]
+    state["todos"] = []
     schemas = tool_schemas()
     messages = [{"role": "user",
                  "content": commit_context(sha, state["diff_max"])}]
@@ -1729,6 +1815,16 @@ def main(argv=None):
                            "findings": findings}, f, indent=2)
                 f.write("\n")
             if args.verbose:
+                todos_path = os.path.join(
+                    args.output_dir, "%s.todos.json" % sha[:10])
+                with open(todos_path, "w") as f:
+                    json.dump({"sha": sha, "subject": subjects[sha],
+                               "todos": state.get("todos", [])},
+                              f, indent=2)
+                    f.write("\n")
+                warn("wrote %s, %s and %s"
+                     % (review_path, findings_path, todos_path))
+            else:
                 warn("wrote %s and %s" % (review_path, findings_path))
 
     if failures:
