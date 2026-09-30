@@ -119,6 +119,7 @@ usage: commit_review.py [-h] --model MODEL [--provider {auto,anthropic,openai,ve
                         [--output-dir OUTPUT_DIR]
                         [--fail-on-severity {none,low,medium,high}]
                         [--dry-run] [--verbose] [--show-thinking]
+                        [--thinking-budget THINKING_BUDGET]
                         commits [commits ...]
 ```
 
@@ -229,7 +230,7 @@ By default, the review tool may load repository-level review guidance from
 
 | Option | Description |
 | --- | --- |
-| `--output-dir OUTPUT_DIR` | Write review artifacts to this directory. Produces `<sha>.review.md` and `<sha>.findings.json`; with `--verbose`, also `<sha>.todos.json` (the model's final `TodoWrite` list). |
+| `--output-dir OUTPUT_DIR` | Write review artifacts to this directory. Produces `<sha>.review.md` and `<sha>.findings.json`; with `--show-thinking`, also `<sha>.thinking.md` (the model's per-turn reasoning); with `--verbose`, also `<sha>.todos.json` (the model's final `TodoWrite` list). |
 | `--fail-on-severity {none,low,medium,high}` | Exit non-zero if any finding meets or exceeds the given severity. Default: `none`. |
 
 Examples:
@@ -259,7 +260,23 @@ commit_review.py \
 | --- | --- |
 | `--dry-run` | Show the resolved plan without calling the API. |
 | `--verbose` | Log turns and tool calls to stderr. |
-| `--show-thinking` | Log thinking replies to stderr, if available. |
+| `--show-thinking` | Enable model thinking where the provider supports it and log the reasoning to stderr per turn; with `--output-dir`, also write `<sha>.thinking.md`. |
+| `--thinking-budget N` | Token budget for Anthropic extended thinking. Default is `4096` when thinking is enabled; setting it also enables thinking. Must stay below `--max-tokens`. |
+
+Thinking behavior by provider:
+
+- **Anthropic**: requests extended thinking (`thinking.budget_tokens`) and
+  adds the interleaved-thinking beta so the model reasons between tool
+  calls too. Thinking blocks (including redacted ones) are preserved across
+  the tool loop as the API requires. Endpoints or proxies that do not
+  support extended thinking will reject the request; omit `--show-thinking`
+  in that case.
+- **OpenAI-compatible**: no request change is needed; reasoning emitted in
+  `reasoning` / `reasoning_content` message fields (o-series-style and
+  DeepSeek/vLLM/OpenRouter-style servers) is logged when present.
+- **Vertex (Gemini)**: sets `thinkingConfig.includeThoughts` for Gemini
+  2.5+ models on the native endpoint, and logs `thought` parts separately
+  from the visible reply instead of mixing them into the report.
 
 Example:
 
@@ -289,6 +306,7 @@ usage: commit_review.py [-h] --model MODEL [--provider {auto,anthropic,openai,ve
                         [--output-dir OUTPUT_DIR]
                         [--fail-on-severity {none,low,medium,high}]
                         [--dry-run] [--verbose] [--show-thinking]
+                        [--thinking-budget THINKING_BUDGET]
                         commits [commits ...]
 
 Per-commit LLM analysis with read-only tool access.
@@ -326,7 +344,12 @@ options:
                         exit non-zero if any finding meets this severity (default: none)
   --dry-run             show the resolved plan without calling the API
   --verbose             log turns and tool calls to stderr
-  --show-thinking       log all thinking replies to stderr
+  --show-thinking       enable model thinking and log the reasoning to stderr
+                        (and to <sha>.thinking.md with --output-dir)
+  --thinking-budget THINKING_BUDGET
+                        thinking token budget for Anthropic extended thinking
+                        (default: 4096 when thinking is enabled); setting it
+                        also enables thinking
 
 commit specs: a single rev (3fed0e7c2, HEAD), a range (HEAD..HEAD~6), or -N for the last N commits.
 ```

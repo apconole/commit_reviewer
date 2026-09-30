@@ -1037,7 +1037,12 @@ def http_post_with_retry(url, headers, body, timeout, verbose):
 
 
 class Provider:
-    """Common interface: chat() -> (text, tool_calls, usage_dict)."""
+    """Common interface: chat() -> (text, tool_calls, usage_dict, thinking).
+
+    thinking is a list of dicts with a "text" display field (plus any
+    provider-specific extra fields needed to send the blocks back),
+    carrying the model's reasoning when it produced any.
+    """
 
     name = "base"
 
@@ -1051,12 +1056,15 @@ class Provider:
 class AnthropicProvider(Provider):
     name = "anthropic"
 
-    def __init__(self, model, api_key, base_url, max_tokens, timeout):
+    def __init__(self, model, api_key, base_url, max_tokens, timeout,
+                 thinking=False, thinking_budget=0):
         self.model = model
         self.api_key = api_key
         self.base_url = (base_url or "https://api.anthropic.com").rstrip("/")
         self.max_tokens = max_tokens
         self.timeout = timeout
+        self.thinking = thinking
+        self.thinking_budget = thinking_budget
 
     def describe(self):
         return "anthropic model=%s endpoint=%s/v1/messages" % (
@@ -1073,6 +1081,17 @@ class AnthropicProvider(Provider):
             role = m["role"]
             if role == "assistant":
                 blocks = []
+                # Extended thinking blocks must be sent back unmodified,
+                # with their signatures, for the conversation to stay
+                # valid; they must also precede all other blocks.
+                for tb in m.get("thinking", []):
+                    if "signature" in tb:
+                        blocks.append({"type": "thinking",
+                                       "thinking": tb.get("thinking", ""),
+                                       "signature": tb.get("signature", "")})
+                    elif "data" in tb:
+                        blocks.append({"type": "redacted_thinking",
+                                       "data": tb.get("data", "")})
                 if m.get("content"):
                     blocks.append({"type": "text", "text": m["content"]})
                 for tc in m.get("tool_calls", []):
@@ -1104,6 +1123,33 @@ class AnthropicProvider(Provider):
                     out.append({"role": "user", "content": m["content"]})
         return out
 
+    @staticmethod
+    def parse_response(data):
+        text = ""
+        calls = []
+        thinking = []
+        for block in data.get("content", []):
+            btype = block.get("type")
+            if btype == "text":
+                text += block.get("text", "")
+            elif btype == "tool_use":
+                calls.append({"id": block.get("id", "toolu_%d"
+                                              % len(calls)),
+                              "name": block.get("name", ""),
+                              "args": block.get("input", {})})
+            elif btype == "thinking":
+                thinking.append({"text": block.get("thinking", ""),
+                                 "thinking": block.get("thinking", ""),
+                                 "signature": block.get("signature", "")})
+            elif btype == "redacted_thinking":
+                thinking.append({"text": "[redacted thinking]",
+                                 "data": block.get("data", "")})
+        usage = data.get("usage", {}) or {}
+        return text, calls, {
+            "input": usage.get("input_tokens", 0),
+            "output": usage.get("output_tokens", 0),
+        }, thinking
+
     def chat(self, system, messages, tools, verbose):
         body = {
             "model": self.model,
@@ -1112,30 +1158,22 @@ class AnthropicProvider(Provider):
             "tools": self._tools(tools),
             "messages": self._messages(messages),
         }
+        headers = {"anthropic-version": "2023-06-01"}
+        if self.thinking:
+            body["thinking"] = {"type": "enabled",
+                                "budget_tokens": self.thinking_budget}
+            # Let the model reason between tool calls, not just before the
+            # first one.
+            headers["anthropic-beta"] = "interleaved-thinking-2025-05-14"
         if self.api_key.startswith("sk-ant-"):
-            headers = {"x-api-key": self.api_key}
+            headers["x-api-key"] = self.api_key
         else:
             # Treat as a bearer token (gateway / proxy auth).
-            headers = {"Authorization": "Bearer " + self.api_key}
-        headers["anthropic-version"] = "2023-06-01"
+            headers["Authorization"] = "Bearer " + self.api_key
         data = http_post_with_retry(
             self.base_url + "/v1/messages", headers, body,
             self.timeout, verbose)
-        text = ""
-        calls = []
-        for block in data.get("content", []):
-            if block.get("type") == "text":
-                text += block.get("text", "")
-            elif block.get("type") == "tool_use":
-                calls.append({"id": block.get("id", "toolu_%d"
-                                             % len(calls)),
-                              "name": block.get("name", ""),
-                              "args": block.get("input", {})})
-        usage = data.get("usage", {}) or {}
-        return text, calls, {
-            "input": usage.get("input_tokens", 0),
-            "output": usage.get("output_tokens", 0),
-        }
+        return AnthropicProvider.parse_response(data)
 
 
 class OpenAIProvider(Provider):
@@ -1209,10 +1247,15 @@ class OpenAIProvider(Provider):
                           "args": args if isinstance(args, dict)
                           else {"value": args}})
         usage = data.get("usage", {}) or {}
+        thinking = []
+        for key in ("reasoning", "reasoning_content"):
+            val = msg.get(key)
+            if isinstance(val, str) and val:
+                thinking.append({"text": val})
         return text, calls, {
             "input": usage.get("prompt_tokens", 0),
             "output": usage.get("completion_tokens", 0),
-        }
+        }, thinking
 
     def chat(self, system, messages, tools, verbose):
         body = {
@@ -1232,13 +1275,14 @@ class VertexProvider(Provider):
     name = "vertex"
 
     def __init__(self, model, token, project, location, max_tokens,
-                 timeout):
+                 timeout, thinking=False):
         self.model = model
         self.token = token
         self.project = project
         self.location = location
         self.max_tokens = max_tokens
         self.timeout = timeout
+        self.thinking = thinking
         base = "https://%s-aiplatform.googleapis.com" % location
         if model.startswith("openai/"):
             self.url = (base + "/v1/projects/%s/locations/%s/"
@@ -1312,6 +1356,9 @@ class VertexProvider(Provider):
             "tools": self._tools(tools),
             "generationConfig": {"maxOutputTokens": self.max_tokens},
         }
+        if self.thinking and re.search(r"gemini-(2\.5|3)", self.model):
+            body["generationConfig"]["thinkingConfig"] = {
+                "includeThoughts": True}
         data = http_post_with_retry(self.url, self._headers(), body,
                                     self.timeout, verbose)
         cands = data.get("candidates") or [{}]
@@ -1319,8 +1366,11 @@ class VertexProvider(Provider):
         parts = (cand.get("content") or {}).get("parts") or []
         text = ""
         calls = []
+        thinking = []
         for i, part in enumerate(parts):
-            if "text" in part:
+            if part.get("thought"):
+                thinking.append({"text": part.get("text", "")})
+            elif "text" in part:
                 text += part["text"]
             fc = part.get("functionCall")
             if fc:
@@ -1331,7 +1381,7 @@ class VertexProvider(Provider):
         return text, calls, {
             "input": meta.get("promptTokenCount", 0),
             "output": meta.get("candidatesTokenCount", 0),
-        }
+        }, thinking
 
 
 def vertex_token(cli_token, env_var):
@@ -1461,7 +1511,12 @@ def chat_with_compaction(provider, system, messages, schemas, verbose):
 
 
 def review_commit(sha, provider, system, state, max_turns):
-    """Run the tool-calling loop for one commit; return (text, stats)."""
+    """Run the tool-calling loop for one commit.
+
+    Returns (text, stats, thinking_log), where thinking_log is a list of
+    (label, thinking_text) entries for every model reply that carried
+    reasoning.
+    """
     verbose = state["verbose"]
     show_thinking = state["show_thinking"]
     state["todos"] = []
@@ -1471,25 +1526,36 @@ def review_commit(sha, provider, system, state, max_turns):
     total_in = 0
     total_out = 0
     final_text = None
+    thinking_log = []
     text = ""
+
+    def log_thinking(label, thinking):
+        parts = [b.get("text", "") for b in thinking or [] if b.get("text")]
+        if not parts:
+            return
+        entry = "\n\n".join(parts)
+        thinking_log.append((label, entry))
+        if show_thinking:
+            warn("=== %s thinking ===\n%s" % (label, entry))
+
     for turn in range(1, max_turns + 1):
-        text, calls, usage = chat_with_compaction(provider, system,
-                                                  messages, schemas,
-                                                  verbose)
+        text, calls, usage, thinking = chat_with_compaction(provider, system,
+                                                            messages, schemas,
+                                                            verbose)
         total_in += usage.get("input", 0)
         total_out += usage.get("output", 0)
         if verbose:
             warn("turn %d: %d tool call(s), %d in / %d out tokens"
                  % (turn, len(calls), usage.get("input", 0),
                     usage.get("output", 0)))
-            if show_thinking:
-                warn(f"=== round thinking ===\n{text}")
+        log_thinking("turn %d" % turn, thinking)
         if not calls:
             final_text = text
             break
         messages.append({"role": "assistant",
                          "content": text or None,
-                         "tool_calls": calls})
+                         "tool_calls": calls,
+                         "thinking": thinking})
         for tc in calls:
             args = tc["args"] if isinstance(tc["args"], dict) else {}
             if verbose:
@@ -1517,11 +1583,11 @@ def review_commit(sha, provider, system, state, max_turns):
                                     "the summary and the final JSON "
                                     "findings block."})
         try:
-            text, calls, usage = chat_with_compaction(provider, system,
-                                                      messages, schemas,
-                                                      verbose)
+            text, calls, usage, thinking = chat_with_compaction(
+                provider, system, messages, schemas, verbose)
             total_in += usage.get("input", 0)
             total_out += usage.get("output", 0)
+            log_thinking("final answer", thinking)
             final_text = text
         except ToolError as e:
             final_text = "(failed to finish review: %s)" % e
@@ -1529,7 +1595,7 @@ def review_commit(sha, provider, system, state, max_turns):
     if final_text is None or not final_text.strip():
         final_text = "(model returned no final text)"
     return final_text, {"input_tokens": total_in,
-                        "output_tokens": total_out}
+                        "output_tokens": total_out}, thinking_log
 
 
 SEV_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3}
@@ -1581,13 +1647,21 @@ def build_provider(args):
         provider_name = detect_provider(args.model, project)
     max_tokens = args.max_tokens
     timeout = args.timeout
+    thinking = bool(args.show_thinking or args.thinking_budget)
+    thinking_budget = args.thinking_budget or 4096
     if provider_name == "anthropic":
         key = resolve_key(args, "anthropic")
         if not key:
             die("no anthropic credentials.  Set ANTHROPIC_API_KEY or "
                 "pass --api-key/--token/--env-var")
+        if thinking and thinking_budget >= max_tokens:
+            warn("thinking budget %d is not below max_tokens %d; "
+                 "clamping to %d" % (thinking_budget, max_tokens,
+                                     max_tokens - 1))
+            thinking_budget = max(1, max_tokens - 1)
         return AnthropicProvider(args.model, key, args.base_url,
-                                 max_tokens, timeout)
+                                 max_tokens, timeout, thinking,
+                                 thinking_budget)
     if provider_name == "openai":
         key = resolve_key(args, "openai")
         if not key:
@@ -1602,7 +1676,7 @@ def build_provider(args):
                 "GOOGLE_CLOUD_PROJECT")
         token = vertex_token(args.token, args.env_var)
         return VertexProvider(args.model, token, project, args.location,
-                              max_tokens, timeout)
+                              max_tokens, timeout, thinking)
     die("unknown provider: %s" % provider_name)
 
 
@@ -1703,7 +1777,13 @@ def parse_args(argv):
     p.add_argument("--verbose", action="store_true",
                    help="log turns and tool calls to stderr")
     p.add_argument("--show-thinking", action="store_true",
-                   help="log all thinking replies to stderr")
+                   help="enable model thinking and log the reasoning to "
+                        "stderr (and to <sha>.thinking.md with "
+                        "--output-dir)")
+    p.add_argument("--thinking-budget", type=int, default=0,
+                   help="thinking token budget for Anthropic extended "
+                        "thinking (default: 4096 when thinking is "
+                        "enabled); setting it also enables thinking")
     return p.parse_args(argv)
 
 
@@ -1782,8 +1862,8 @@ def main(argv=None):
               % (i, len(shas), sha[:10], subjects[sha]))
         print("=" * 72)
         try:
-            text, stats = review_commit(sha, provider, system, state,
-                                        args.max_turns)
+            text, stats, thinking_log = review_commit(sha, provider, system,
+                                                      state, args.max_turns)
         except ToolError as e:
             failures += 1
             warn("review failed for %s: %s" % (sha[:10], e))
@@ -1814,6 +1894,16 @@ def main(argv=None):
                 json.dump({"sha": sha, "subject": subjects[sha],
                            "findings": findings}, f, indent=2)
                 f.write("\n")
+            written = [review_path, findings_path]
+            if args.show_thinking and thinking_log:
+                thinking_path = os.path.join(
+                    args.output_dir, "%s.thinking.md" % sha[:10])
+                with open(thinking_path, "w") as f:
+                    f.write("# Thinking for %s (%s)\n\n"
+                            % (sha[:10], subjects[sha]))
+                    for label, entry in thinking_log:
+                        f.write("## %s\n\n%s\n\n" % (label, entry))
+                written.append(thinking_path)
             if args.verbose:
                 todos_path = os.path.join(
                     args.output_dir, "%s.todos.json" % sha[:10])
@@ -1822,10 +1912,8 @@ def main(argv=None):
                                "todos": state.get("todos", [])},
                               f, indent=2)
                     f.write("\n")
-                warn("wrote %s, %s and %s"
-                     % (review_path, findings_path, todos_path))
-            else:
-                warn("wrote %s and %s" % (review_path, findings_path))
+                written.append(todos_path)
+            warn("wrote %s" % ", ".join(written))
 
     if failures:
         return 1
