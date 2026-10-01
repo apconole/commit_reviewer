@@ -62,150 +62,13 @@ import time
 import urllib.error
 import urllib.request
 
-TOOL_OUTPUT_LIMIT = 60000
-SUBPROCESS_TIMEOUT = 20
-HTTP_RETRIES = 4
-MAX_GREP_RESULTS = 500
-MAX_LOG_ENTRIES = 100
-MAX_LIST_ENTRIES = 500
-MAX_FILE_LINES = 2000
-MAX_FILE_BYTES = 200000
-
-SEVERITIES = ("none", "low", "medium", "high")
-
-OUTPUT_FORMAT_FINDINGS = """\
-After writing the report as specified above, end your final message with
-exactly one fenced JSON block of the form:
-```json
-{
-  "findings": [
-    {
-      "type": "Memory Safety | Logic | Concurrency | API | Documentation",
-      "title": "short summary",
-      "description": "what is wrong",
-      "reasoning": "how you verified it and why it matters",
-      "severity": "high | medium | low",
-      "severity_explanation": "consequence and triggering path",
-      "locations": [
-        {
-          "file": "path",
-          "function_or_symbol": "name or null",
-          "line_range": "NN-NN",
-          "why_this_location_matters": "..."
-        }
-      ],
-      "preexisting": false
-    }
-  ]
-}
-```
-If there are no issues, end with {"findings": []}.
-This JSON block is required even when the report above already says PASS
-with no concerns; it is parsed by tooling, not read by a person, so it must
-be the last thing in your message and it must be valid JSON with no trailing
-commentary after the closing fence.
-"""
-
-OUTPUT_FORMAT_INLINE = """\
-Write all output as plain ascii text, without any special characters or
-emojis.
-Your report must be conversational and undramatic.
-Your report must be factual, just technical observations.
-Call issues as 'regressions' or 'concerns'.
-Write out each concern as a reply to the hunk to which it belongs.
-When writing the reply, the hunks need to be quoted inline with '> ' in front
-of each line.  Preserve long lines.
-If you have no concerns for a hunk, omit it.  At the bottom of the reply, you
-should write 'Verdict: ' followed by one of PASS, FAIL, WARN
-depending on whether there are major concerns.
-A commit that has no concerns should be marked PASS.
-Minor concerns should be WARN.
-Major concerns should be FAIL.
-"""
-
-SYSTEM_PROMPT = f"""\
-You are a meticulous, read-only code reviewer performing per-commit \
-analysis in a git repository.
-
-GUIDELINE (general):
-Never: open with preamble or pleasantries; restate the question; add filler transitions; hedge with niceties; or repeat a point you've already made.
-Always: keep essential steps, caveats, uncertainties, and specifics — never drop correctness or a needed warning for brevity. Keep the final answer lean. Use the least structure that conveys it (plain prose when short; lists or code only when they earn their place). If genuinely uncertain, say so and explain why — never omit uncertainty for the sake of brevity.
-If something is ambiguous, ask a sharp question, don't guess.
-
-SAFETY RULES (absolute):
-1. You have READ-ONLY tools.  Never attempt to modify, create, or delete
-   files, and never request actions that change repository or system state.
-   If you find a bug, report it; do not attempt to fix it.  TodoWrite is
-   the one exception: it only updates your in-memory task list.
-2. Only inspect the repository working tree and git history via the tools
-   provided.  Do not access the network or anything outside the repository.
-3. If a credential or secret appears in the code, flag it as a finding but
-   do not repeat the secret value in your report.
-4. Report only findings you verified with tools.  If a concern cannot be
-   verified, label it "unverified" instead of asserting it.
-5. Stay in scope: review the commit under analysis.  Read surrounding code
-   only to understand context, and do not report unrelated pre-existing
-   issues unless the commit makes them worse.
-
-REVIEW PROCEDURE (start here):
-1. Read the commit message and the diff provided in the request.  State the
-   changed files and the intended purpose of the change.
-2. For each changed hunk, read the enclosing function in full (read_file,
-   sed_read, or awk_read) and identify the invariants it relies on.
-3. Use grep to locate callers and consumers of changed behavior, and
-   git_log to understand how the invariants evolved when they are not
-   obvious.
-4. Focus on: correctness (bounds, off-by-one, overflow, signedness,
-   endianness, protocol field handling), memory safety (leaks, double free,
-   use-after-free), concurrency (locking, atomics, lock ordering), error
-   handling, and API/ABI compatibility.
-5. Distinguish problems introduced by this commit from pre-existing issues.
-
-OUTPUT FORMAT:
-{OUTPUT_FORMAT_INLINE}
-{OUTPUT_FORMAT_FINDINGS}
-"""
-
-
-class ToolError(Exception):
-    pass
-
-
-def die(msg):
-    sys.stderr.write("commit_review: %s\n" % msg)
-    sys.exit(1)
-
-
-def warn(msg):
-    sys.stderr.write("commit_review: %s\n" % msg)
-
-
-def clip(text, limit=TOOL_OUTPUT_LIMIT):
-    text = text.replace("\r\n", "\n")
-    if len(text) > limit:
-        return text[:limit] + "\n[...truncated %d chars...]\n" % (
-            len(text) - limit)
-    return text
-
-
-def run_git(args, timeout=SUBPROCESS_TIMEOUT):
-    cmd = ["git", "--no-pager"] + args
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise ToolError("git %s timed out after %ds" %
-                        (" ".join(args), timeout))
-    except OSError as e:
-        raise ToolError("failed to run git: %s" % e)
-    out = p.stdout
-    if p.returncode != 0:
-        err = p.stderr.strip()
-        raise ToolError("git %s failed (exit %d)%s" %
-                        (" ".join(args[:2]), p.returncode,
-                         (": " + err[:500]) if err else ""))
-    return out
-
+from commit_reviewer.constants import (
+    TOOL_OUTPUT_LIMIT, SUBPROCESS_TIMEOUT, HTTP_RETRIES, MAX_GREP_RESULTS,
+    MAX_LOG_ENTRIES, MAX_LIST_ENTRIES, MAX_FILE_LINES, MAX_FILE_BYTES,
+    SEVERITIES, SYSTEM_PROMPT)
+from commit_reviewer.util import (
+    ToolError, die, warn, clip, run_git, run_external, shutil_which,
+    safe_abs_path, check_pathspec)
 
 RE_REV = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/~^@{}:-]*$")
 RE_NEG_COUNT = re.compile(r"^-([1-9][0-9]*)$")
@@ -376,27 +239,6 @@ def build_system_prompt(root, agents_files, skills, selected_skills):
 # Tool implementations (all read-only, confined to the repository root;
 # TodoWrite only tracks in-memory review progress)
 # ---------------------------------------------------------------------------
-
-
-def safe_abs_path(root, p):
-    if p is None or p == "":
-        return root
-    if not isinstance(p, str) or "\x00" in p:
-        raise ToolError("invalid path: %r" % (p,))
-    full = os.path.abspath(os.path.join(root, p))
-    root_real = os.path.realpath(root)
-    full_real = os.path.realpath(full)
-    if full_real != root_real and \
-            not full_real.startswith(root_real + os.sep):
-        raise ToolError("path escapes the repository: %s" % p)
-    return full
-
-
-def check_pathspec(file_):
-    if not file_ or file_.startswith("/") or "\x00" in file_ or \
-            ".." in file_.split("/"):
-        raise ToolError("invalid file pathspec: %r" % file_)
-    return file_
 
 
 def tool_read_file(root, args, verbose):
@@ -698,25 +540,6 @@ def validate_awk(program):
             raise ToolError("awk_read: %s is not allowed "
                             "(read-only programs only)" % label)
     return True
-
-
-def run_external(cmd, timeout=SUBPROCESS_TIMEOUT):
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise ToolError("%s timed out after %ds" % (cmd[0], timeout))
-    except OSError as e:
-        raise ToolError("failed to run %s: %s" % (cmd[0], e))
-    out = p.stdout
-    if p.returncode != 0:
-        err = p.stderr.strip()
-        raise ToolError("%s failed (exit %d)%s" %
-                        (cmd[0], p.returncode,
-                         (": " + err[:500]) if err else ""))
-    if not out.strip():
-        return "(no output)"
-    return out
 
 
 def tool_sed_read(root, args, verbose):
@@ -1421,14 +1244,6 @@ def vertex_token(cli_token, env_var):
         "--env-var, VERTEX_TOKEN, or 'gcloud auth print-access-token', "
         "or install the 'google-auth' package with application default "
         "credentials.%s" % hint)
-
-
-def shutil_which(name):
-    for d in os.environ.get("PATH", "").split(os.pathsep):
-        p = os.path.join(d, name)
-        if os.access(p, os.X_OK):
-            return p
-    return None
 
 
 # ---------------------------------------------------------------------------
