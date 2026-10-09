@@ -9,7 +9,8 @@
 #   BASE_REF=origin/master
 #   REVIEW_SCRIPT=/home/me/git/review-series.py
 #   REVIEW_ARGS=--provider openai --model foo --max-turns 20
-#   MAIL_TO=me@example.com
+#   MAIL_TO=me@example.com,you@example.com
+#   MAIL_CC=other@example.com
 #   MAIL_FROM=me@example.com
 #   STATE_FILE=/home/me/.cache/review-new-series/seen
 #   BRANCH_PATTERN=series_[0-9]*
@@ -41,7 +42,10 @@ REVIEW_ARGS="${REVIEW_ARGS:-}"
 
 # Set these explicitly in your environment/crontab if your git-send-email
 # configuration doesn't already provide them.
+#
+# MAIL_TO and MAIL_CC accept a comma-separated list of addresses.
 MAIL_TO="${MAIL_TO:-list@project.org}"
+MAIL_CC="${MAIL_CC:-}"
 MAIL_FROM="${MAIL_FROM:-robot@project.org}"
 
 STATE_FILE="${STATE_FILE:-$HOME/.cache/review-new-series/seen}"
@@ -72,6 +76,33 @@ die()
 {
     log "ERROR: $*"
     exit 1
+}
+
+# Split a comma-separated address list into one trimmed, non-empty address
+# per line on stdout. Empty input produces no output.
+split_addrs()
+{
+    local raw="$1" addr
+    local -a parts=()
+    [[ -n "$raw" ]] || return 0
+    local IFS=','
+    read -r -a parts <<< "$raw"
+    for addr in "${parts[@]}"; do
+        addr="${addr#"${addr%%[![:space:]]*}"}"
+        addr="${addr%"${addr##*[![:space:]]}"}"
+        [[ -n "$addr" ]] && printf '%s\n' "$addr"
+    done
+}
+
+# Join the arguments into a single comma-separated header value.
+join_addrs()
+{
+    local sep="" addr out=""
+    for addr in "$@"; do
+        out="${out}${sep}${addr}"
+        sep=", "
+    done
+    printf '%s' "$out"
 }
 
 cleanup()
@@ -123,11 +154,32 @@ if [[ -z "$MAIL_FROM" ]]; then
     MAIL_FROM="$("$GIT" config --get sendemail.from || true)"
 fi
 
+if [[ -z "$MAIL_CC" ]]; then
+    MAIL_CC="$("$GIT" config --get sendemail.cc || true)"
+fi
+
 [[ -n "$MAIL_TO" ]] \
     || die "MAIL_TO is not set and sendemail.to is not configured"
 
 [[ -n "$MAIL_FROM" ]] \
     || die "MAIL_FROM is not set and sendemail.from is not configured"
+
+###############################################################################
+# Expand the comma-separated address lists into arrays and precompute the
+# header values used when constructing the mbox message.
+###############################################################################
+
+mapfile -t MAIL_TO_ADDRS < <(split_addrs "$MAIL_TO")
+mapfile -t MAIL_CC_ADDRS < <(split_addrs "$MAIL_CC")
+
+[[ ${#MAIL_TO_ADDRS[@]} -gt 0 ]] \
+    || die "MAIL_TO did not contain any usable addresses"
+
+TO_HEADER="$(join_addrs ${MAIL_TO_ADDRS[@]+"${MAIL_TO_ADDRS[@]}"})"
+CC_HEADER=""
+if [[ ${#MAIL_CC_ADDRS[@]} -gt 0 ]]; then
+    CC_HEADER="$(join_addrs "${MAIL_CC_ADDRS[@]}")"
+fi
 
 ###############################################################################
 # Serialize cron invocations.
@@ -304,7 +356,10 @@ for ref in "${SERIES_REFS[@]}"; do
 
     {
         printf 'From: %s\n' "$MAIL_FROM"
-        printf 'To: %s\n' "$MAIL_TO"
+        printf 'To: %s\n' "$TO_HEADER"
+        if [[ -n "$CC_HEADER" ]]; then
+            printf 'Cc: %s\n' "$CC_HEADER"
+        fi
         printf 'Subject: review-series: %s (%s, %s commits)\n' \
             "$branch" "$result" "$count"
         printf 'Date: %s\n' "$(LC_ALL=C date -R)"
@@ -326,9 +381,16 @@ for ref in "${SERIES_REFS[@]}"; do
 
     log "sending review result for $branch"
 
+    send_email_args=(--from="$MAIL_FROM")
+    for addr in ${MAIL_TO_ADDRS[@]+"${MAIL_TO_ADDRS[@]}"}; do
+        send_email_args+=(--to="$addr")
+    done
+    for addr in ${MAIL_CC_ADDRS[@]+"${MAIL_CC_ADDRS[@]}"}; do
+        send_email_args+=(--cc="$addr")
+    done
+
     "$GIT" send-email \
-        --to="$MAIL_TO" \
-        --from="$MAIL_FROM" \
+        "${send_email_args[@]}" \
         --confirm=never \
         --no-validate \
         --no-annotate \

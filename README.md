@@ -393,8 +393,9 @@ REVIEW_SCRIPT=/home/me/git/commit_review.py
 # Extra arguments passed to the review script.
 REVIEW_ARGS=--provider openai --model my-model --max-turns 20
 
-# Optional mail notification addresses.
-MAIL_TO=me@example.com
+# Optional mail notification addresses. Both accept a comma-separated list.
+MAIL_TO=me@example.com,you@example.com
+MAIL_CC=other@example.com
 MAIL_FROM=me@example.com
 
 # State file used to remember which series branches have already been processed.
@@ -439,6 +440,20 @@ Notes:
 - Arguments are split on whitespace, so argument values must not contain
   spaces.
 
+### Mail notification addresses: `MAIL_TO`, `MAIL_CC`, `MAIL_FROM`
+
+Review results are mailed as an RFC-2822 message via `git send-email`.
+
+- `MAIL_TO` and `MAIL_CC` accept a **comma-separated list** of addresses,
+  for example `MAIL_TO=me@example.com,you@example.com`. Whitespace around
+  each address is ignored and empty entries are dropped.
+- Each address becomes its own `--to`/`--cc` argument to `git send-email`,
+  and the message's `To:` (and optional `Cc:`) headers list every address.
+- `MAIL_CC` is optional; when it is unset no `Cc:` header is emitted.
+- When `MAIL_TO`, `MAIL_FROM`, or `MAIL_CC` are unset, the script falls back
+  to the repository's `sendemail.to`, `sendemail.from`, and `sendemail.cc`
+  git configuration, respectively.
+
 ### Example usage
 
 Assuming the environment variables above are set:
@@ -459,7 +474,7 @@ A simple cron entry might look like this:
   BASE_REF=origin/master \
   REVIEW_SCRIPT=/home/me/git/commit_review.py \
   REVIEW_ARGS=--provider openai --model my-model --max-turns 20 \
-  MAIL_TO=me@example.com \
+  MAIL_TO=me@example.com,you@example.com \
   MAIL_FROM=me@example.com \
   STATE_FILE=/home/me/.cache/review-new-series/seen \
   /home/me/git/review-new-series.sh \
@@ -478,7 +493,8 @@ BRANCH_PATTERN=series_[0-9]*
 BASE_REF=origin/master
 REVIEW_SCRIPT=/home/me/git/commit_review.py
 REVIEW_ARGS=--provider openai --model my-model --max-turns 20
-MAIL_TO=me@example.com
+MAIL_TO=me@example.com,you@example.com
+MAIL_CC=other@example.com
 MAIL_FROM=me@example.com
 STATE_FILE=/home/me/.cache/review-new-series/seen
 ```
