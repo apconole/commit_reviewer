@@ -32,6 +32,12 @@ Auth sources, in order of precedence:
   variable, and for vertex: gcloud auth print-access-token or google.auth
   application default credentials.
 
+Multiple backends:
+  Repeat --backend 'provider=...,model=...,base-url=...,label=...' to run
+  several endpoints concurrently.  --backend-strategy separate (default) has
+  every backend review every commit for cross-checking; combine partitions
+  the commits across backends for throughput.
+
 Context:
   AGENTS.md at the repository root is loaded automatically (disable with
   --no-agents); extra files may be added with --agents-file.  Skill files

@@ -18,12 +18,15 @@
 import argparse
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from .agent import (review_commit, parse_findings, worst_severity, SEV_RANK)
 from .constants import SEVERITIES
 from .context import (discover_skills, build_system_prompt, load_agents_files,
                       resolve_selected_skills)
 from .gitcommits import parse_commit_specs
+from .multi import (parse_backend_spec, make_backend_namespace, backend_label,
+                    plan_backends)
 from .providers import build_provider
 from .util import ToolError, die, warn, run_git
 
@@ -36,14 +39,28 @@ def parse_args(argv):
                "(HEAD..HEAD~6), or -N for the last N commits.")
     p.add_argument("commits", nargs="+",
                    help="commit specs: rev, range (A..B), or -N")
-    p.add_argument("--model", required=True,
+    p.add_argument("--model",
                    help="model name, e.g. claude-sonnet-4-5, gpt-4o, "
-                        "gemini-2.5-pro")
+                        "gemini-2.5-pro; required unless every backend sets "
+                        "its own model via --backend")
     p.add_argument("--provider",
                    choices=["auto", "anthropic", "openai", "vertex"],
                    default="auto",
-                   help="LLM provider (default: auto-detect from model "
-                        "name)")
+                    help="LLM provider (default: auto-detect from model "
+                         "name)")
+    p.add_argument("--backend", action="append", default=[],
+                   metavar="KEY=VALUE,...",
+                   help="add a review backend; a comma-separated list of "
+                        "key=value overrides (provider, model, base-url, "
+                        "api-key, token, env-var, project, location, label). "
+                        "Repeatable to run several backends together; when "
+                        "omitted the top-level provider options are used.")
+    p.add_argument("--backend-strategy", choices=["separate", "combine"],
+                   default="separate",
+                   help="how to distribute commits across backends: "
+                        "'separate' reviews every commit with every backend "
+                        "for cross-checking (default); 'combine' partitions "
+                        "commits across backends for throughput")
     p.add_argument("--base-url",
                    help="override API base URL (anthropic/openai)")
     p.add_argument("--api-key", help="API key (anthropic/openai)")
@@ -92,7 +109,157 @@ def parse_args(argv):
                    help="thinking token budget for Anthropic extended "
                         "thinking (default: 4096 when thinking is "
                         "enabled); setting it also enables thinking")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if not args.model and not args.backend:
+        p.error("--model is required unless --backend is used")
+    return args
+
+
+def build_backends(args):
+    """Resolve the ordered list of (label, provider) backends to review with.
+
+    With no --backend options this is exactly a single unlabeled provider from
+    the top-level options.  Each --backend spec overrides a subset of those
+    options so several endpoints can run side by side.
+    """
+    if not args.backend:
+        try:
+            return [("", build_provider(args))]
+        except ToolError as e:
+            die(str(e))
+    backends = []
+    for i, spec_str in enumerate(args.backend):
+        spec = parse_backend_spec(spec_str)
+        ns = make_backend_namespace(args, spec)
+        if not getattr(ns, "model", None):
+            die("backend %d (%s): no model set (add model=... to --backend "
+                "or a top-level --model)"
+                % (i + 1, backend_label(spec, i)))
+        try:
+            provider = build_provider(ns)
+        except ToolError as e:
+            die("backend %d (%s): %s"
+                % (i + 1, backend_label(spec, i), e))
+        backends.append((backend_label(spec, i), provider))
+    return backends
+
+
+def review_backend(bindex, label, provider, shas, system, base_state, args):
+    """Review one backend's assigned commits, in order.
+
+    Runs inside its own thread.  Every commit gets a fresh copy of the shared
+    state so the per-commit todo list never races with other backends; the
+    read-only entries (root, skills, ...) are safely shared by reference.
+    """
+    name = label or "backend"
+    results = []
+    for sha in shas:
+        state = dict(base_state)
+        try:
+            text, stats, thinking_log = review_commit(
+                sha, provider, system, state, args.max_turns)
+        except ToolError as e:
+            warn("review failed for %s on %s: %s" % (sha[:10], name, e))
+            results.append({"bindex": bindex, "label": label, "sha": sha,
+                            "error": str(e)})
+            continue
+        findings = parse_findings(text)
+        if findings is None:
+            warn("no findings JSON block found in final output (%s)" % name)
+            findings = []
+        results.append({"bindex": bindex, "label": label, "sha": sha,
+                        "text": text, "findings": findings,
+                        "sev": worst_severity(findings), "stats": stats,
+                        "thinking_log": thinking_log,
+                        "todos": state.get("todos", [])})
+    return results
+
+
+def _output_stem(sha, res, multi):
+    if multi and res["label"]:
+        return "%s.%s" % (sha[:10], res["label"])
+    return sha[:10]
+
+
+def write_outputs(res, subject, multi, args):
+    """Persist one result's review/findings (and thinking/todos) files."""
+    stem = _output_stem(res["sha"], res, multi)
+    labeled = multi and res["label"]
+    review_path = os.path.join(args.output_dir, "%s.review.md" % stem)
+    findings_path = os.path.join(args.output_dir,
+                                 "%s.findings.json" % stem)
+    with open(review_path, "w") as f:
+        if labeled:
+            f.write("# Review of %s\n\nBackend: %s\n\n%s\n\n%s\n"
+                    % (res["sha"], res["label"], subject, res["text"]))
+        else:
+            f.write("# Review of %s\n\n%s\n\n%s\n"
+                    % (res["sha"], subject, res["text"]))
+    payload = {"sha": res["sha"], "subject": subject,
+               "findings": res["findings"]}
+    if labeled:
+        payload["backend"] = res["label"]
+    with open(findings_path, "w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    written = [review_path, findings_path]
+    if args.show_thinking and res["thinking_log"]:
+        thinking_path = os.path.join(args.output_dir,
+                                     "%s.thinking.md" % stem)
+        with open(thinking_path, "w") as f:
+            f.write("# Thinking for %s (%s)\n\n"
+                    % (res["sha"][:10], subject))
+            for tlabel, entry in res["thinking_log"]:
+                f.write("## %s\n\n%s\n\n" % (tlabel, entry))
+        written.append(thinking_path)
+    if args.verbose:
+        todos_path = os.path.join(args.output_dir, "%s.todos.json" % stem)
+        todos_payload = {"sha": res["sha"], "subject": subject,
+                         "todos": res["todos"]}
+        if labeled:
+            todos_payload["backend"] = res["label"]
+        with open(todos_path, "w") as f:
+            json.dump(todos_payload, f, indent=2)
+            f.write("\n")
+        written.append(todos_path)
+    warn("wrote %s" % ", ".join(written))
+
+
+def emit_results(shas, subjects, backends, results_by_sha, multi, args):
+    """Print every commit's report(s) and write outputs; return aggregates."""
+    overall_rank = 0
+    failures = 0
+    for i, sha in enumerate(shas, 1):
+        print("=" * 72)
+        print("[%d/%d] commit %s  %s"
+              % (i, len(shas), sha[:10], subjects[sha]))
+        print("=" * 72)
+        for res in sorted(results_by_sha.get(sha, []),
+                          key=lambda r: r["bindex"]):
+            label = res["label"]
+            if multi:
+                print()
+                print("### backend: %s (%s)"
+                      % (label, backends[res["bindex"]][1].describe()))
+            if res.get("error"):
+                failures += 1
+                print("(review failed: %s)" % res["error"])
+                continue
+            print()
+            print(res["text"])
+            findings = res["findings"]
+            sev = res["sev"]
+            prefix = ("backend %s | " % label) if multi else ""
+            print()
+            print("---")
+            print("%sfindings: %d  worst severity: %s  tokens: %d in / %d out"
+                  % (prefix, len(findings), sev,
+                     res["stats"]["input_tokens"],
+                     res["stats"]["output_tokens"]))
+            overall_rank = max(overall_rank, SEV_RANK[sev])
+            if args.output_dir:
+                write_outputs(res, subjects[sha], multi, args)
+    return overall_rank, failures
 
 
 def main(argv=None):
@@ -119,10 +286,8 @@ def main(argv=None):
     agents_files = load_agents_files(root, args.agents_file,
                                      args.no_agents)
 
-    try:
-        provider = build_provider(args)
-    except ToolError as e:
-        die(str(e))
+    backends = build_backends(args)
+    multi = len(backends) > 1
 
     try:
         system = build_system_prompt(root, agents_files, skills,
@@ -138,7 +303,13 @@ def main(argv=None):
     if args.dry_run:
         print("commit_review dry run")
         print("  repo:      %s" % root)
-        print("  provider:  %s" % provider.describe())
+        if multi:
+            print("  strategy:  %s" % args.backend_strategy)
+            print("  backends:  %d" % len(backends))
+            for label, provider in backends:
+                print("    - %-16s %s" % (label, provider.describe()))
+        else:
+            print("  provider:  %s" % backends[0][1].describe())
         print("  commits:   %d" % len(shas))
         for sha in shas:
             print("    - %s %s" % (sha[:10], subjects[sha]))
@@ -162,66 +333,22 @@ def main(argv=None):
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    overall_rank = 0
-    failures = 0
-    for i, sha in enumerate(shas, 1):
-        print("=" * 72)
-        print("[%d/%d] commit %s  %s"
-              % (i, len(shas), sha[:10], subjects[sha]))
-        print("=" * 72)
-        try:
-            text, stats, thinking_log = review_commit(sha, provider, system,
-                                                      state, args.max_turns)
-        except ToolError as e:
-            failures += 1
-            warn("review failed for %s: %s" % (sha[:10], e))
-            print("(review failed: %s)" % e)
-            continue
-        print()
-        print(text)
-        findings = parse_findings(text)
-        if findings is None:
-            warn("no findings JSON block found in final output")
-            findings = []
-        sev = worst_severity(findings)
-        print()
-        print("---")
-        print("findings: %d  worst severity: %s  tokens: %d in / %d out"
-              % (len(findings), sev, stats["input_tokens"],
-                 stats["output_tokens"]))
-        overall_rank = max(overall_rank, SEV_RANK[sev])
-        if args.output_dir:
-            review_path = os.path.join(
-                args.output_dir, "%s.review.md" % sha[:10])
-            findings_path = os.path.join(
-                args.output_dir, "%s.findings.json" % sha[:10])
-            with open(review_path, "w") as f:
-                f.write("# Review of %s\n\n%s\n\n%s\n"
-                        % (sha, subjects[sha], text))
-            with open(findings_path, "w") as f:
-                json.dump({"sha": sha, "subject": subjects[sha],
-                           "findings": findings}, f, indent=2)
-                f.write("\n")
-            written = [review_path, findings_path]
-            if args.show_thinking and thinking_log:
-                thinking_path = os.path.join(
-                    args.output_dir, "%s.thinking.md" % sha[:10])
-                with open(thinking_path, "w") as f:
-                    f.write("# Thinking for %s (%s)\n\n"
-                            % (sha[:10], subjects[sha]))
-                    for label, entry in thinking_log:
-                        f.write("## %s\n\n%s\n\n" % (label, entry))
-                written.append(thinking_path)
-            if args.verbose:
-                todos_path = os.path.join(
-                    args.output_dir, "%s.todos.json" % sha[:10])
-                with open(todos_path, "w") as f:
-                    json.dump({"sha": sha, "subject": subjects[sha],
-                               "todos": state.get("todos", [])},
-                              f, indent=2)
-                    f.write("\n")
-                written.append(todos_path)
-            warn("wrote %s" % ", ".join(written))
+    plan = plan_backends(shas, len(backends), args.backend_strategy)
+
+    results_by_sha = {sha: [] for sha in shas}
+    with ThreadPoolExecutor(max_workers=len(backends)) as pool:
+        futures = [
+            pool.submit(review_backend, bindex, label, provider,
+                        assigned, system, state, args)
+            for bindex, ((label, provider), assigned)
+            in enumerate(zip(backends, plan))
+        ]
+        for fut in futures:
+            for res in fut.result():
+                results_by_sha[res["sha"]].append(res)
+
+    overall_rank, failures = emit_results(shas, subjects, backends,
+                                          results_by_sha, multi, args)
 
     if failures:
         return 1

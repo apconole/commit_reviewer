@@ -109,9 +109,13 @@ commit_review.py --model claude-sonnet-4-5 --dry-run -5
 ### Basic usage
 
 ```text
-usage: commit_review.py [-h] --model MODEL [--provider {auto,anthropic,openai,vertex}]
-                        [--base-url BASE_URL] [--api-key API_KEY] [--token TOKEN]
-                        [--env-var ENV_VAR] [--project PROJECT] [--location LOCATION]
+usage: commit_review.py [-h] [--model MODEL]
+                        [--provider {auto,anthropic,openai,vertex}]
+                        [--backend KEY=VALUE,...]
+                        [--backend-strategy {separate,combine}]
+                        [--base-url BASE_URL] [--api-key API_KEY]
+                        [--token TOKEN] [--env-var ENV_VAR]
+                        [--project PROJECT] [--location LOCATION]
                         [--max-tokens MAX_TOKENS] [--max-turns MAX_TURNS]
                         [--timeout TIMEOUT] [--diff-max-kb DIFF_MAX_KB]
                         [--skill-dir SKILL_DIR] [--skill SKILL]
@@ -204,6 +208,34 @@ commit_review.py \
 | `--env-var ENV_VAR` | Name of an environment variable containing the API key or token. |
 | `--project PROJECT` | GCP project for Vertex. |
 | `--location LOCATION` | GCP location for Vertex. Default is `us-central1`. |
+| `--backend KEY=VALUE,...` | Add a review backend with per-backend overrides (`provider`, `model`, `base-url`, `api-key`, `token`, `env-var`, `project`, `location`, `label`). Repeatable to run several backends concurrently. When omitted, the top-level options above are used for a single backend. |
+| `--backend-strategy {separate,combine}` | How commits are distributed across backends. `separate` (default) reviews every commit with every backend for cross-checking; `combine` partitions commits across backends for throughput. |
+
+### Multiple backends
+
+Pass `--backend` more than once to run several models or endpoints at the
+same time. Each `--backend` value is a comma-separated list of `key=value`
+overrides applied on top of the top-level options, so each backend can point
+at a different provider, model, endpoint, and credential:
+
+```bash
+commit_review.py \
+  --backend 'provider=openai,model=gpt-4o,base-url=https://a.example/v1' \
+  --backend 'provider=anthropic,model=claude-sonnet-4-5,label=alt' \
+  -5
+```
+
+- Backends run concurrently (one worker per backend), each reviewing its
+  assigned commits sequentially.
+- `separate` (default) has every backend review every commit, producing one
+  report per backend for cross-checking. `combine` partitions the commits
+  round-robin across backends to reduce wall-clock time when you have several
+  equivalent endpoints.
+- The optional `label` key names each backend in the console output and in
+  `--output-dir` filenames; it defaults to the sanitized model name. When
+  more than one backend runs, artifacts are suffixed with the label (for
+  example `<sha>.alt.review.md`) so parallel reports do not overwrite each
+  other. A single backend keeps the plain `<sha>.*` names.
 
 ### Review limits
 
@@ -230,7 +262,7 @@ By default, the review tool may load repository-level review guidance from
 
 | Option | Description |
 | --- | --- |
-| `--output-dir OUTPUT_DIR` | Write review artifacts to this directory. Produces `<sha>.review.md` and `<sha>.findings.json`; with `--show-thinking`, also `<sha>.thinking.md` (the model's per-turn reasoning); with `--verbose`, also `<sha>.todos.json` (the model's final `TodoWrite` list). |
+| `--output-dir OUTPUT_DIR` | Write review artifacts to this directory. Produces `<sha>.review.md` and `<sha>.findings.json`; with `--show-thinking`, also `<sha>.thinking.md` (the model's per-turn reasoning); with `--verbose`, also `<sha>.todos.json` (the model's final `TodoWrite` list). When multiple backends run, each filename is suffixed with the backend label (`<sha>.<label>.*`). |
 | `--fail-on-severity {none,low,medium,high}` | Exit non-zero if any finding meets or exceeds the given severity. Default: `none`. |
 
 Examples:
@@ -296,9 +328,13 @@ commit_review.py \
 <summary>Show full help output</summary>
 
 ```text
-usage: commit_review.py [-h] --model MODEL [--provider {auto,anthropic,openai,vertex}]
-                        [--base-url BASE_URL] [--api-key API_KEY] [--token TOKEN]
-                        [--env-var ENV_VAR] [--project PROJECT] [--location LOCATION]
+usage: commit_review.py [-h] [--model MODEL]
+                        [--provider {auto,anthropic,openai,vertex}]
+                        [--backend KEY=VALUE,...]
+                        [--backend-strategy {separate,combine}]
+                        [--base-url BASE_URL] [--api-key API_KEY]
+                        [--token TOKEN] [--env-var ENV_VAR]
+                        [--project PROJECT] [--location LOCATION]
                         [--max-tokens MAX_TOKENS] [--max-turns MAX_TURNS]
                         [--timeout TIMEOUT] [--diff-max-kb DIFF_MAX_KB]
                         [--skill-dir SKILL_DIR] [--skill SKILL]
@@ -316,9 +352,22 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --model MODEL         model name, e.g. claude-sonnet-4-5, gpt-4o, gemini-2.5-pro
+  --model MODEL         model name, e.g. claude-sonnet-4-5, gpt-4o,
+                        gemini-2.5-pro; required unless every backend sets its
+                        own model via --backend
   --provider {auto,anthropic,openai,vertex}
                         LLM provider (default: auto-detect from model name)
+  --backend KEY=VALUE,...
+                        add a review backend; a comma-separated list of
+                        key=value overrides (provider, model, base-url, api-
+                        key, token, env-var, project, location, label).
+                        Repeatable to run several backends together; when
+                        omitted the top-level provider options are used.
+  --backend-strategy {separate,combine}
+                        how to distribute commits across backends: 'separate'
+                        reviews every commit with every backend for cross-
+                        checking (default); 'combine' partitions commits
+                        across backends for throughput
   --base-url BASE_URL   override API base URL (anthropic/openai)
   --api-key API_KEY     API key (anthropic/openai)
   --token TOKEN         bearer token (anthropic proxy, openai, vertex)
@@ -331,17 +380,21 @@ options:
                         max tool-calling turns per commit (default: 30)
   --timeout TIMEOUT     HTTP timeout in seconds (default: 300)
   --diff-max-kb DIFF_MAX_KB
-                        max diff bytes embedded per commit, in KB (default: 120)
+                        max diff bytes embedded per commit, in KB (default:
+                        120)
   --skill-dir SKILL_DIR
-                        directory of skill .md files (repeatable; default: .skills in the repo root)
+                        directory of skill .md files (repeatable; default:
+                        .skills in the repo root)
   --skill SKILL         skill name or file to load fully (repeatable)
   --agents-file AGENTS_FILE
-                        additional AGENTS.md-style instruction file (repeatable)
+                        additional AGENTS.md-style instruction file
+                        (repeatable)
   --no-agents           do not auto-load AGENTS.md from the repo root
   --output-dir OUTPUT_DIR
                         write <sha>.review.md and <sha>.findings.json here
   --fail-on-severity {none,low,medium,high}
-                        exit non-zero if any finding meets this severity (default: none)
+                        exit non-zero if any finding meets this severity
+                        (default: none)
   --dry-run             show the resolved plan without calling the API
   --verbose             log turns and tool calls to stderr
   --show-thinking       enable model thinking and log the reasoning to stderr
@@ -351,7 +404,8 @@ options:
                         (default: 4096 when thinking is enabled); setting it
                         also enables thinking
 
-commit specs: a single rev (3fed0e7c2, HEAD), a range (HEAD..HEAD~6), or -N for the last N commits.
+commit specs: a single rev (3fed0e7c2, HEAD), a range (HEAD..HEAD~6), or -N
+for the last N commits.
 ```
 
 </details>
