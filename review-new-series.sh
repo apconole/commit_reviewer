@@ -360,6 +360,8 @@ for ref in "${SERIES_REFS[@]}"; do
         if [[ -n "$CC_HEADER" ]]; then
             printf 'Cc: %s\n' "$CC_HEADER"
         fi
+        printf 'Content-Type: text/plain; charset=utf-8\n'
+        printf 'Content-Transfer-Encoding: 8bit\n'
         printf 'Subject: review-series: %s (%s, %s commits)\n' \
             "$branch" "$result" "$count"
         printf 'Date: %s\n' "$(LC_ALL=C date -R)"
