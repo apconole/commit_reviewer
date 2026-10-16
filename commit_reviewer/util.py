@@ -23,7 +23,7 @@ import sys
 import tempfile
 import uuid
 
-from .constants import TOOL_OUTPUT_LIMIT, SUBPROCESS_TIMEOUT
+from .constants import TOOL_OUTPUT_LIMIT, TOOL_PAGE_LIMIT, SUBPROCESS_TIMEOUT
 
 
 class ToolError(Exception):
@@ -45,6 +45,25 @@ def clip(text, limit=TOOL_OUTPUT_LIMIT):
         return text[:limit] + "\n[...truncated %d chars...]\n" % (
             len(text) - limit)
     return text
+
+
+def cap_text(text, limit=TOOL_PAGE_LIMIT, hint=""):
+    """Cap tool output to ``limit`` characters, cutting on a line boundary so
+    a partial line is never sent.  Unlike clip() (the hard last-resort net),
+    this appends an actionable note telling the model how to narrow the query
+    (offsets, ranges, grep) instead of silently dropping the tail."""
+    text = text.replace("\r\n", "\n")
+    if len(text) <= limit:
+        return text
+    cut = text.rfind("\n", 0, limit)
+    if cut <= 0:
+        cut = limit
+    note = "\n[... output capped: %d of %d chars shown ...]" % (
+        cut, len(text))
+    if hint:
+        note += "\n" + hint
+    return text[:cut] + note
+
 
 
 def run_git(args, timeout=SUBPROCESS_TIMEOUT):

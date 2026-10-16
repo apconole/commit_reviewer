@@ -155,13 +155,18 @@ def review_commit(sha, provider, system, state, max_turns):
             except ToolError as e:
                 out = "[tool error] %s" % e
                 is_error = True
+            sent = clip(out)
             if verbose:
-                warn("  -> %d char(s)%s" % (len(out),
-                                            " (error)" if is_error else ""))
+                note = " (error)" if is_error else ""
+                if len(sent) != len(out):
+                    warn("  -> %d char(s) sent (%d raw, clipped)%s"
+                         % (len(sent), len(out), note))
+                else:
+                    warn("  -> %d char(s)%s" % (len(out), note))
             messages.append({"role": "tool",
                              "tool_call_id": tc["id"],
                              "name": tc["name"],
-                             "content": clip(out),
+                             "content": sent,
                              "is_error": is_error})
     if final_text is None:
         # Tool budget exhausted mid-loop: ask for the final answer once.

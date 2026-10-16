@@ -17,8 +17,8 @@
 
 import os
 
-from ..constants import MAX_FILE_LINES, MAX_LIST_ENTRIES
-from ..util import ToolError, warn, safe_abs_path
+from ..constants import MAX_FILE_LINES, MAX_LIST_ENTRIES, TOOL_PAGE_LIMIT
+from ..util import ToolError, warn, safe_abs_path, cap_text
 from . import tool
 
 
@@ -64,8 +64,10 @@ def read_file(state, args):
                 lines.append("%6d  %s" % (i, line.rstrip("\n")))
     if not lines:
         return "(file is empty or range is out of bounds)"
-    return "%s\n[%d line(s) shown, range %d-%d]" % (
-        "\n".join(lines), len(lines), start, end)
+    hint = ("re-run read_file with start_line/end_line to page, or use "
+            "grep/sed_read to locate the region you need")
+    return cap_text("%s\n[%d line(s) shown, range %d-%d]" % (
+        "\n".join(lines), len(lines), start, end), TOOL_PAGE_LIMIT, hint)
 
 
 @tool(

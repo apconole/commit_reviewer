@@ -18,7 +18,8 @@
 import os
 import re
 
-from ..util import ToolError, run_external, safe_abs_path
+from ..constants import TOOL_PAGE_LIMIT
+from ..util import ToolError, run_external, safe_abs_path, cap_text
 from . import tool
 
 SED_ALLOWED_CMDS = set("pnd=lhsHgytbNPDx")
@@ -179,7 +180,10 @@ def sed_read(state, args):
     if len(expr) > 4096:
         raise ToolError("expression too long (max 4096)")
     validate_sed(expr)
-    return run_external(["sed", "-n", "-e", expr, path])
+    hint = ("narrow the sed script (for example a tighter line range or "
+            "address) to reduce output")
+    return cap_text(run_external(["sed", "-n", "-e", expr, path]),
+                    TOOL_PAGE_LIMIT, hint)
 
 
 @tool(
@@ -211,4 +215,7 @@ def awk_read(state, args):
     if len(program) > 8192:
         raise ToolError("program too long (max 8192)")
     validate_awk(program)
-    return run_external(["awk", program, path])
+    hint = ("narrow the awk program (for example add a condition or line "
+            "range) to reduce output")
+    return cap_text(run_external(["awk", program, path]), TOOL_PAGE_LIMIT,
+                    hint)

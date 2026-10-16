@@ -16,13 +16,13 @@
 """Tunable limits, severity levels, and prompt templates."""
 
 TOOL_OUTPUT_LIMIT = 60000
+TOOL_PAGE_LIMIT = 48000
 SUBPROCESS_TIMEOUT = 20
 HTTP_RETRIES = 4
 MAX_GREP_RESULTS = 500
 MAX_LOG_ENTRIES = 100
 MAX_LIST_ENTRIES = 500
 MAX_FILE_LINES = 2000
-MAX_FILE_BYTES = 200000
 
 SEVERITIES = ("none", "low", "medium", "high")
 

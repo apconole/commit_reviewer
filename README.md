@@ -60,6 +60,10 @@ Notes and limitations:
 - Every reviewed commit pays a checkout cost; for large series point
   `--worktree-dir` at fast local storage.
 
+Tool results are size-bounded and, for file reads, line-numbered and pageable
+via `start_line`/`end_line`, so oversized files never flood the prompt (see
+[Review is taking too long](#review-is-taking-too-long)).
+
 ### `review-new-series.sh`
 
 `review-new-series.sh` is designed for automated series review.
@@ -765,6 +769,13 @@ You can reduce work by:
 - lowering `--diff-max-kb`
 - reviewing fewer commits at once
 - using a faster model
+
+Tool output is bounded so oversized reads do not balloon the prompt (a common
+cause of provider read timeouts). File reads (`read_file`, and `git_show` with
+`file=`) are line-numbered and page via `start_line`/`end_line`; when any tool
+result exceeds the per-tool budget it is cut on a line boundary and annotated
+with `[... output capped ...]` plus a hint to narrow the query. The model can
+then request a specific range instead of receiving an arbitrary head slice.
 
 Example:
 
