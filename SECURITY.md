@@ -38,8 +38,7 @@ What to include: a description of the issue, the affected version (commit),
 and, where possible, the steps or input that trigger it.
 
 The maintainer will acknowledge a valid report and work on a fix on a
-best-effort basis. <!-- TBD: state an explicit acknowledgment/fix window once
-established, e.g. "acknowledged within 5 business days". -->
+best-effort basis.
 
 ---
 
