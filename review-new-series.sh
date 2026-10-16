@@ -113,6 +113,12 @@ cleanup()
         "$GIT" -C "$REPO" worktree remove --force "$CURRENT_WORKTREE" \
             >/dev/null 2>&1 || true
     fi
+    # Prune any per-commit review worktrees commit_review.py may have left
+    # registered if it exited abnormally.
+    "$GIT" -C "$REPO" worktree prune >/dev/null 2>&1 || true
+    if [[ -n "${CR_WORKTREE_DIR:-}" ]]; then
+        rm -rf "$CR_WORKTREE_DIR"
+    fi
 }
 
 trap cleanup EXIT INT TERM
@@ -281,6 +287,12 @@ fi
 
 read -r -a REVIEW_ARGS_ARRAY <<< "$REVIEW_ARGS"
 
+# Parent directory for the per-commit worktrees commit_review.py creates to
+# pin its file tools to each reviewed commit. Kept under WORKTREE_ROOT (and
+# therefore outside $REPO) so checkouts share a filesystem and never pollute
+# the reviewed tree.
+CR_WORKTREE_DIR="$WORKTREE_ROOT/cr-$$"
+
 for ref in "${SERIES_REFS[@]}"; do
     oid="$("$GIT" rev-parse "$ref^{commit}")"
 
@@ -337,7 +349,8 @@ for ref in "${SERIES_REFS[@]}"; do
     set +e
     (
         cd "$CURRENT_WORKTREE" || exit 1
-        "$REVIEW_SCRIPT" ${REVIEW_ARGS_ARRAY[@]+"${REVIEW_ARGS_ARRAY[@]}"} "-$count"
+        "$REVIEW_SCRIPT" ${REVIEW_ARGS_ARRAY[@]+"${REVIEW_ARGS_ARRAY[@]}"} \
+            --worktree-dir "$CR_WORKTREE_DIR" "-$count"
     ) >"$review_output" 2>&1
     review_status=$?
     set -e

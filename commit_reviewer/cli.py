@@ -28,7 +28,8 @@ from .gitcommits import parse_commit_specs
 from .multi import (parse_backend_spec, make_backend_namespace, backend_label,
                     plan_backends)
 from .providers import build_provider
-from .util import ToolError, die, warn, run_git
+from .util import (ToolError, die, warn, run_git, create_review_worktree,
+                   remove_review_worktree)
 
 
 def parse_args(argv):
@@ -80,6 +81,12 @@ def parse_args(argv):
     p.add_argument("--diff-max-kb", type=int, default=120,
                    help="max diff bytes embedded per commit, in KB "
                         "(default: 120)")
+    p.add_argument("--worktree-dir",
+                   help="parent directory for the temporary detached "
+                        "worktrees used to pin file tools to each reviewed "
+                        "commit (default: system temp dir). Must live "
+                        "outside the repository; point it at a fast/local "
+                        "filesystem for large repos.")
     p.add_argument("--skill-dir", action="append", default=[],
                    help="directory of skill .md files (repeatable; "
                         "default: .skills in the repo root)")
@@ -156,6 +163,14 @@ def review_backend(bindex, label, provider, shas, system, base_state, args):
     for sha in shas:
         state = dict(base_state)
         try:
+            worktree = create_review_worktree(sha, args.worktree_dir)
+        except ToolError as e:
+            warn("could not pin %s on %s: %s" % (sha[:10], name, e))
+            results.append({"bindex": bindex, "label": label, "sha": sha,
+                            "error": str(e)})
+            continue
+        state["root"] = worktree
+        try:
             text, stats, thinking_log = review_commit(
                 sha, provider, system, state, args.max_turns)
         except ToolError as e:
@@ -163,6 +178,8 @@ def review_backend(bindex, label, provider, shas, system, base_state, args):
             results.append({"bindex": bindex, "label": label, "sha": sha,
                             "error": str(e)})
             continue
+        finally:
+            remove_review_worktree(worktree)
         findings = parse_findings(text)
         if findings is None:
             warn("no findings JSON block found in final output (%s)" % name)
@@ -269,6 +286,9 @@ def main(argv=None):
     except ToolError as e:
         die("not in a git repository: %s" % e)
 
+    if args.worktree_dir:
+        args.worktree_dir = os.path.abspath(args.worktree_dir)
+
     try:
         shas = parse_commit_specs(args.commits)
     except ToolError as e:
@@ -322,6 +342,8 @@ def main(argv=None):
                   % ", ".join(sorted(selected_skills)))
         print("  limits:    max_turns=%d max_tokens=%d diff_max=%dKB"
               % (args.max_turns, args.max_tokens, args.diff_max_kb))
+        print("  worktrees: %s"
+              % (args.worktree_dir or "(system temp dir)"))
         if args.output_dir:
             print("  output:    %s" % os.path.abspath(args.output_dir))
         return 0
@@ -332,6 +354,12 @@ def main(argv=None):
 
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
+    if args.worktree_dir:
+        try:
+            os.makedirs(args.worktree_dir, exist_ok=True)
+        except OSError as e:
+            die("cannot create --worktree-dir %s: %s"
+                % (args.worktree_dir, e))
 
     plan = plan_backends(shas, len(backends), args.backend_strategy)
 

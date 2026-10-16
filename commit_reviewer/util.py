@@ -17,8 +17,11 @@
 path-safety helpers."""
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+import uuid
 
 from .constants import TOOL_OUTPUT_LIMIT, SUBPROCESS_TIMEOUT
 
@@ -109,3 +112,45 @@ def check_pathspec(file_):
             ".." in file_.split("/"):
         raise ToolError("invalid file pathspec: %r" % file_)
     return file_
+
+
+def create_review_worktree(sha, base_dir=None):
+    """Create a temporary detached worktree pinned to ``sha``.
+
+    The working-tree file tools read from the repository root, so pointing
+    them at a checkout of the exact commit under review keeps file contents
+    and line numbers aligned with the diff being reviewed.  Returns the
+    absolute path of the new worktree; callers must pass it to
+    remove_review_worktree when done.
+
+    ``base_dir`` selects where the worktree is created (default: the system
+    temp dir).  It should live outside the repository so the checkout does
+    not pollute grep/listing.  The base directory itself is never removed --
+    only the unique per-commit subdirectory we create under it.
+    """
+    base = os.path.abspath(base_dir) if base_dir else tempfile.gettempdir()
+    path = os.path.join(
+        base, "commit-review-%s-%s" % (sha[:8], uuid.uuid4().hex))
+    try:
+        run_git(["worktree", "add", "--detach", path, sha])
+    except ToolError as e:
+        raise ToolError("could not create review worktree for %s: %s"
+                        % (sha[:10], e))
+    return path
+
+
+def remove_review_worktree(path):
+    """Remove a worktree created by create_review_worktree and prune stale
+    administrative entries.  Best-effort and idempotent: never raises, and
+    leaves the parent base directory in place."""
+    if not path:
+        return
+    try:
+        run_git(["worktree", "remove", "--force", path])
+    except ToolError:
+        shutil.rmtree(path, ignore_errors=True)
+    finally:
+        try:
+            run_git(["worktree", "prune"])
+        except ToolError:
+            pass

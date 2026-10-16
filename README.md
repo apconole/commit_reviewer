@@ -38,6 +38,28 @@ It can be configured to use Anthropic, OpenAI-compatible, or Vertex-based
 inference providers, and can optionally load repository-specific review
 instructions from `AGENTS.md` and skill files.
 
+#### Pinned file reads
+
+When reviewing commits that are not the current tip (for example `-5`, or a
+range), the working-tree tools (`read_file`, `grep`, `sed_read`, `awk_read`,
+`list_directory`) must see the exact revision under review, otherwise their
+contents and line numbers will not line up with the diff being reviewed.
+
+To guarantee this, `commit_review.py` checks out each reviewed commit into a
+temporary **detached worktree** and points the file tools at it for the
+duration of that commit's review, removing the worktree when done. The
+worktrees live in the system temp directory by default; use `--worktree-dir`
+to place them on a specific (fast/local) filesystem. The directory must live
+outside the repository so the checkouts never pollute `grep`/listings.
+
+Notes and limitations:
+
+- Untracked and ignored files (build artifacts, generated headers) are absent
+  from the pinned checkout — usually desirable for review.
+- Submodules are not auto-initialized in the temporary worktree.
+- Every reviewed commit pays a checkout cost; for large series point
+  `--worktree-dir` at fast local storage.
+
 ### `review-new-series.sh`
 
 `review-new-series.sh` is designed for automated series review.
@@ -118,6 +140,7 @@ usage: commit_review.py [-h] [--model MODEL]
                         [--project PROJECT] [--location LOCATION]
                         [--max-tokens MAX_TOKENS] [--max-turns MAX_TURNS]
                         [--timeout TIMEOUT] [--diff-max-kb DIFF_MAX_KB]
+                        [--worktree-dir WORKTREE_DIR]
                         [--skill-dir SKILL_DIR] [--skill SKILL]
                         [--agents-file AGENTS_FILE] [--no-agents]
                         [--output-dir OUTPUT_DIR]
@@ -245,6 +268,7 @@ commit_review.py \
 | `--max-turns MAX_TURNS` | Maximum number of tool-calling turns per commit. Default: `30`. |
 | `--timeout TIMEOUT` | HTTP timeout in seconds. Default: `300`. |
 | `--diff-max-kb DIFF_MAX_KB` | Maximum diff size embedded per commit, in KB. Default: `120`. |
+| `--worktree-dir WORKTREE_DIR` | Parent directory for the temporary detached worktrees that pin the file tools to each reviewed commit. Must be outside the repository. Defaults to the system temp dir; point it at a fast/local filesystem for large repos. |
 
 ### Skills and instructions
 
@@ -337,6 +361,7 @@ usage: commit_review.py [-h] [--model MODEL]
                         [--project PROJECT] [--location LOCATION]
                         [--max-tokens MAX_TOKENS] [--max-turns MAX_TURNS]
                         [--timeout TIMEOUT] [--diff-max-kb DIFF_MAX_KB]
+                        [--worktree-dir WORKTREE_DIR]
                         [--skill-dir SKILL_DIR] [--skill SKILL]
                         [--agents-file AGENTS_FILE] [--no-agents]
                         [--output-dir OUTPUT_DIR]
@@ -382,6 +407,12 @@ options:
   --diff-max-kb DIFF_MAX_KB
                         max diff bytes embedded per commit, in KB (default:
                         120)
+  --worktree-dir WORKTREE_DIR
+                        parent directory for the temporary detached worktrees
+                        used to pin file tools to each reviewed commit
+                        (default: system temp dir). Must live outside the
+                        repository; point it at a fast/local filesystem for
+                        large repos.
   --skill-dir SKILL_DIR
                         directory of skill .md files (repeatable; default:
                         .skills in the repo root)
@@ -482,15 +513,20 @@ REVIEW_ARGS=--provider openai --model my-model --max-turns 20
 the review script is invoked as:
 
 ```bash
-commit_review.py --provider openai --model my-model --max-turns 20 -3
+commit_review.py --provider openai --model my-model --max-turns 20 \
+    --worktree-dir "$WORKTREE_ROOT/cr-$$" -3
 ```
 
 Notes:
 
 - The positional commit count (`-N`) is always appended automatically, so
   do not include a commit spec in `REVIEW_ARGS`.
+- `--worktree-dir` is injected automatically (pointing under `WORKTREE_ROOT`,
+  outside the repository) so `commit_review.py`'s per-commit pinned checkouts
+  share a filesystem with the script's own worktree. Do not set it yourself in
+  `REVIEW_ARGS`.
 - `REVIEW_ARGS` is empty by default; the review script is then run with no
-  options beyond the commit count.
+  options beyond the commit count and `--worktree-dir`.
 - Arguments are split on whitespace, so argument values must not contain
   spaces.
 

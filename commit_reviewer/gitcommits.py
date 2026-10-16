@@ -93,5 +93,9 @@ def commit_context(sha, max_diff_bytes):
                 + "\n[... diff truncated; use git_show or read_file "
                   "for the full change ...]\n")
         note = " (diff truncated)"
-    return ("Review commit %s\n%s\n%s%s\n%s"
+    return ("Review commit %s\n"
+            "File tools (read_file, grep, sed_read, awk_read, "
+            "list_directory) are pinned to a checkout of this exact commit, "
+            "so their contents and line numbers match the diff below.\n%s\n"
+            "%s%s\n%s"
             % (sha, meta, stat, note, diff))
